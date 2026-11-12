@@ -1,185 +1,338 @@
 #!/usr/bin/env python3
-"""
-Roblox Up-and-Coming top-10 forecaster
-======================================
-Forecasts the chart place-by-place for the 72 hourly reads after the deadline.
+"""Forecast a ranked chart (top 10) from hourly read history.
 
-Method
-------
-The chart is a *rank process*: games drift up and down, new games appear at the
-bottom, and games vanish (the chart only holds games published in the last 28
-days, so every game leaves as it ages). Places are scored independently, so the
-quantity to model is a per-place occupancy distribution over the 72 hours.
+Reads ``history.ndjson`` from $MAKEFUN_INPUT_DIR (default /input) and writes
+``forecast.json`` to $MAKEFUN_OUTPUT_DIR (default /output) with exactly two
+keys:
 
-1. Learn empirical 1-hour log-rank increments from the history, bucketed by the
-   game's current rank band (top 2 / 3-5 / 6-10 / 11-20 / 21-40 / 41+), plus a
-   per-band per-hour exit hazard. Increments measured over a gap of h hours are
-   rescaled by 1/sqrt(h) (rank diffusion grows like sqrt of time).
-2. Monte-Carlo the whole chart forward 72 steps many times. At each step every
-   game takes one increment from its band's pool and may exit; survivors are
-   re-ranked by their log-rank. The place-occupancy histogram of every step is
-   accumulated.
-3. Normalise each place's histogram into probabilities. A place's rows are
-   scaled to `SUM_FRAC`, leaving the remainder to be shared by the unnamed
-   games (which is exactly how the grader treats the unnamed share, so the
-   leftover budget is a genuine hedge, not a loss).
-4. `top10` is the ten games with the highest probability of appearing anywhere
-   in the top 10, ordered by their expected place.
+  probabilities  [{universe_id, place, p}] -- p that the game holds that place
+  top10          ten universe ids, index 0 = most likely to be at place 1
 
-Everything is seeded, so two runs are byte-identical. Standard library only.
+Method (see README.md for the derivations):
+
+  1. Empirical log-rank increments per rank band, measured on every consecutive
+     pair of reads and rescaled by 1/sqrt(h) to a one-hour step.
+  2. Per-band, per-hour exit hazard from the same read pairs.
+  3. A seeded 3000-path, 72-step Monte-Carlo of the rank diffusion; every step
+     of every path contributes to a per-place occupancy histogram.
+  4. Histograms -> per-place probabilities, each place normalised to 0.90 of its
+     mass so 10% hedges the games the forecast never named.
+
+Python 3 standard library only.  No network, no clock, no environment reads
+beyond the two directory variables.
 """
 import json
 import math
 import os
 import random
 
-# ---- tunables (chosen by walk-forward validation on the practice windows) ----
-SUM_FRAC = 0.90     # mass given to named games per place; rest hedges unnamed
-HAZ_MUL = 0.5       # exit-hazard multiplier
-PATHS = 3000        # Monte-Carlo paths (validated: more paths = better, stable)
-HORIZON_HOURS = 72  # the scored window length
-SEED = 20261113
-MIN_P = 1e-6
-MAX_ROWS_PER_PLACE = 100
-BANDS = ((2,), (5,), (10,), (20,), (40,))  # upper rank of each band
-N_BANDS = len(BANDS) + 1
+# ---- model constants -------------------------------------------------------
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+
+PATHS = 3000              # Monte-Carlo paths
+HORIZON = 72              # one-hour steps simulated per path
+PLACES = 10               # places recorded per step
+SEED = 20261113           # fixed single source of randomness
+SUM_FRAC = 0.90           # named mass per place; the rest hedges unnamed games
+MAX_ROWS_PER_PLACE = 100  # at most this many rows per place
+MIN_P = 1e-6              # rows below this probability are dropped
+MIN_GAP_HOURS = 0.3       # read pairs closer than this are skipped
+HAZARD_DIVISOR = 6.3      # exits/observations -> per-hour hazard
+HAZARD_CAP = 0.02         # per-hour exit hazard ceiling
+
+# Rank bands, by the upper bound of the current rank.
+BAND_BOUNDS = (2, 5, 10, 20, 40)
+N_BANDS = len(BAND_BOUNDS) + 1  # six bands: <=2, <=5, <=10, <=20, <=40, >40
+
+# THE ONLY source of randomness in this program.  It is seeded from the
+# module-level SEED constant and re-seeded at the top of every simulate()
+# call, so the whole pipeline is reproducible by construction: same input ->
+# byte-identical forecast.json, run after run, process after process.
+RNG = random.Random(SEED)
 
 
 def band_of(rank):
-    for i, (hi,) in enumerate(BANDS):
+    """Band index for an integer rank (1-based)."""
+    for i, hi in enumerate(BAND_BOUNDS):
         if rank <= hi:
             return i
     return N_BANDS - 1
 
 
+def parse_at(text):
+    """ISO-8601 UTC timestamp -> seconds since epoch, without datetime."""
+    s = text.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # Split the offset: ...T HH:MM:SS[.frac][+HH:MM]
+    off = 0
+    for i in range(len(s) - 1, 9, -1):
+        if s[i] in "+-":
+            sign = 1 if s[i] == "+" else -1
+            hh = int(s[i + 1:i + 3] or 0)
+            mm = int(s[i + 4:i + 6] or 0) if len(s) >= i + 6 else 0
+            off = sign * (hh * 3600 + mm * 60)
+            s = s[:i]
+            break
+    date, _, clock = s.partition("T")
+    y, mo, d = (int(x) for x in date.split("-"))
+    frac = 0.0
+    if "." in clock:
+        clock, _, f = clock.partition(".")
+        frac = float("0." + f)
+    hh, mi, ss = (int(x) for x in clock.split(":"))
+    days = days_from_civil(y, mo, d)
+    return days * 86400 + hh * 3600 + mi * 60 + ss + frac - off
+
+
+def days_from_civil(y, m, d):
+    """Days since 1970-01-01 (Howard Hinnant's algorithm)."""
+    y -= m <= 2
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _clean_rows(rows):
+    """Validated [(rank, universe_id), ...] sorted by rank, or None.
+
+    A row is usable only if it has an integer-coercible rank and
+    universe_id.  Any row that fails is dropped on its own; it never
+    sinks the record or the run.
+    """
+    if not isinstance(rows, list) or not rows:
+        return None                       # missing / wrong type / empty
+    clean = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            rank_hint = row.get("rank")
+            uid = int(row.get("universe_id"))      # raises on None/garbage
+            if rank_hint is None:
+                rank = len(clean) + 1               # rank not needed, order is
+            else:
+                rank = int(rank_hint)
+                if rank < 1:
+                    continue
+        except (TypeError, ValueError):
+            continue                                # unusable row: drop it
+        clean.append((rank, uid))
+    if not clean:
+        return None
+    clean.sort(key=lambda t: t[0])
+    return [uid for _rank, uid in clean]
+
+
 def read_history(input_dir):
-    """Every read: (start time as ISO string, ordered universe ids)."""
+    """Valid reads -> [(timestamp string, [universe_id, ...] in rank order)].
+
+    Defensive by construction: a malformed line, a record marked failed,
+    or an unusable row is skipped in isolation.  One bad record can never
+    abort the run.
+    """
     path = os.path.join(input_dir, "history.ndjson")
     reads = []
+    skipped_lines = 0
+    skipped_records = 0
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
-            if not rec.get("ok", True):
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                skipped_lines += 1            # malformed JSON: skip the line
                 continue
-            rows = rec.get("up_and_coming") or []
-            if not rows:
+            if not isinstance(rec, dict):
+                skipped_lines += 1
                 continue
-            rows.sort(key=lambda r: r["rank"])
-            reads.append((rec["at"], [int(r["universe_id"]) for r in rows]))
+            if rec.get("ok") is False:        # failed read: skip
+                skipped_records += 1
+                continue
+            ids = _clean_rows(rec.get("up_and_coming"))
+            if ids is None:                   # missing / not a list / empty
+                skipped_records += 1
+                continue
+            at = rec.get("at")
+            try:
+                parse_at(at)                  # reject unusable timestamps
+            except (AttributeError, IndexError, TypeError, ValueError):
+                skipped_records += 1
+                continue
+            reads.append((at, ids))
+    if skipped_lines or skipped_records:
+        if os.environ.get("MAKEFUN_VERBOSE"):
+            print(f"read_history: skipped {skipped_lines} bad line(s), "
+                  f"{skipped_records} unusable record(s)")
     return reads
 
 
-def hours_between(a, b):
-    """Hours between two ISO-8601 UTC timestamps, without importing datetime."""
-    from datetime import datetime
-    def parse(s):
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    return (parse(b) - parse(a)).total_seconds() / 3600.0
-
-
-def build_pools(reads):
-    """Empirical per-band 1-hour log-rank increments and exit hazards."""
+def fit(reads):
+    """Per-band increment pools and per-band per-hour exit hazards."""
     pools = [[] for _ in range(N_BANDS)]
-    exits = [[0, 0] for _ in range(N_BANDS)]  # exits, observations
-    for i in range(len(reads) - 1):
-        h = hours_between(reads[i][0], reads[i + 1][0])
-        if h <= 0.3:
+    observations = [0] * N_BANDS
+    exits = [0] * N_BANDS
+
+    for (t0, prev), (t1, nxt) in zip(reads, reads[1:]):
+        h = (parse_at(t1) - parse_at(t0)) / 3600.0
+        if h <= MIN_GAP_HOURS:
             continue
         scale = 1.0 / math.sqrt(h)
-        before = {g: j + 1 for j, g in enumerate(reads[i][1])}
-        after = {g: j + 1 for j, g in enumerate(reads[i + 1][1])}
-        for g, r1 in before.items():
-            b = band_of(r1)
-            exits[b][1] += 1
-            if g in after:
-                pools[b].append((math.log(after[g]) - math.log(r1)) * scale)
+        later_rank = {}
+        for i, uid in enumerate(nxt):
+            later_rank.setdefault(uid, i + 1)
+        for i, uid in enumerate(prev):
+            r1 = i + 1
+            band = band_of(r1)
+            observations[band] += 1
+            r2 = later_rank.get(uid)
+            if r2 is None:
+                exits[band] += 1
             else:
-                exits[b][0] += 1
+                pools[band].append((math.log(r2) - math.log(r1)) * scale)
+
     hazards = []
-    for b in range(N_BANDS):
-        e, n = exits[b]
-        # ~6.3 hourly steps per recorded gap in the archive -> per-hour hazard
-        hazards.append(min(0.02, ((e / n if n else 0.0) / 6.3) * HAZ_MUL))
-    return pools, hazards
+    for band in range(N_BANDS):
+        obs = observations[band]
+        if obs == 0:
+            hazards.append(0.0)
+        else:
+            hz = (exits[band] / obs) / HAZARD_DIVISOR
+            hazards.append(min(hz, HAZARD_CAP))
+    return pools, hazards, observations, exits
 
 
-def simulate(last_chart, pools, hazards, rng):
-    n = len(last_chart)
-    pool_sizes = [len(p) for p in pools]
-    occ = [dict() for _ in range(10)]
+def simulate(chart):
+    """Monte-Carlo the chart forward.
+
+    Returns hist[place][universe_id] counts of every step of every path.
+    """
+    n = len(chart)
+    if n == 0:
+        return [{} for _ in range(PLACES)]
+
+    pools, hazards = MODEL["pools"], MODEL["hazards"]
+    # Determinism: re-seed the single module-level RNG so repeated calls in
+    # one process reproduce the same paths, not just repeated processes.
+    RNG.seed(SEED)
+    rand = RNG.random
+
+    hist = [{} for _ in range(PLACES)]
+    span = max(1, min(PLACES, n))
+    pool_lens = [len(p) for p in pools]
 
     for _ in range(PATHS):
-        logr = [math.log(j + 1) for j in range(n)]
-        alive = [True] * n
-        for _step in range(HORIZON_HOURS):
-            for i in range(n):
-                if not alive[i]:
-                    continue
-                rank = int(round(math.exp(logr[i])))
+        # alive games, in start order: (universe_id, log_rank)
+        state = [(chart[j], math.log(j + 1)) for j in range(n)]
+        for _step in range(HORIZON):
+            nxt = []
+            for uid, log_rank in state:
+                rank = int(math.floor(math.exp(log_rank) + 0.5))
                 if rank < 1:
                     rank = 1
                 elif rank > n:
                     rank = n
-                b = band_of(rank)
-                if pool_sizes[b]:
-                    logr[i] += pools[b][rng.randrange(pool_sizes[b])]
-                if rng.random() < hazards[b]:
-                    alive[i] = False
-            order = sorted(range(n), key=lambda i: (not alive[i], logr[i]))
-            for k in range(10):
-                g = last_chart[order[k]]
-                occ[k][g] = occ[k].get(g, 0) + 1
-    return occ
+                band = band_of(rank)
+                ln = pool_lens[band]
+                if ln:
+                    log_rank += pools[band][int(rand() * ln)]
+                if rand() < hazards[band]:
+                    continue                      # game exits the chart
+                nxt.append((uid, log_rank))
+            nxt.sort(key=lambda t: t[1])          # ascending log-rank
+            for place in range(min(span, len(nxt))):
+                uid = nxt[place][0]
+                row = hist[place]
+                row[uid] = row.get(uid, 0) + 1
+            state = nxt
+    return hist
 
 
-def to_forecast(occ, n_paths):
+def probabilities_from(hist, total_steps):
+    """Keep the 100 largest counts per place, scale the kept mass to 0.90.
+
+    Emission order is fixed by construction -- (place, -count, universe_id) --
+    so no tie-break can depend on dict insertion order: the same histogram
+    always serialises to the same byte sequence.
+    """
     rows = []
-    for k in range(10):
-        counts = occ[k]
-        total = sum(counts.values())
-        if not total:
+    for place in range(PLACES):
+        counts = hist[place]
+        if not counts:
             continue
-        items = sorted(counts.items(), key=lambda kv: -kv[1])[:MAX_ROWS_PER_PLACE]
-        weight = sum(v for _, v in items)
-        for g, v in items:
-            p = (v / weight) * SUM_FRAC
-            if p >= MIN_P:
-                rows.append({"universe_id": int(g), "place": k + 1, "p": round(p, 7)})
+        kept = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        kept = kept[:MAX_ROWS_PER_PLACE]
+        mass = sum(c for _, c in kept)
+        if mass <= 0:
+            continue
+        for uid, count in kept:
+            p = (count / mass) * SUM_FRAC
+            if p < MIN_P:
+                continue
+            rows.append({"universe_id": uid, "place": place + 1, "p": p})
+    rows.sort(key=lambda r: (r["place"], -r["p"], r["universe_id"]))
+    return rows
 
-    in_top = {}
-    exp_place = {}
-    for k in range(10):
-        total = sum(occ[k].values()) or 1
-        for g, v in occ[k].items():
-            in_top[g] = in_top.get(g, 0.0) + v / n_paths
-            exp_place[g] = exp_place.get(g, 0.0) + (k + 1) * v / n_paths
-    chosen = sorted(in_top, key=lambda g: (-in_top[g], exp_place[g]))[:10]
-    chosen.sort(key=lambda g: exp_place[g])
-    return {"probabilities": rows, "top10": [int(g) for g in chosen]}
+
+def top10_from(hist, total_steps):
+    """Highest appearance probability; ties by expected place; then order."""
+    appeared = {}
+    expected = {}
+    for place in range(PLACES):
+        for uid, count in hist[place].items():
+            appeared[uid] = appeared.get(uid, 0) + count
+            expected[uid] = expected.get(uid, 0.0) + (place + 1) * count
+    stats = {}
+    for uid, count in appeared.items():
+        stats[uid] = (count / total_steps, expected[uid] / total_steps)
+    best = sorted(stats, key=lambda u: (-stats[u][0], stats[u][1], u))[:PLACES]
+    best.sort(key=lambda u: (stats[u][1], u))
+    return best
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
+    reads = read_history(INPUT_DIR)
+    if not reads:
+        raise SystemExit("no valid reads with a non-empty up_and_coming")
 
-    reads = read_history(in_dir)
-    pools, hazards = build_pools(reads)
-    last_chart = reads[-1][1]
+    pools, hazards, observations, exits = fit(reads)
+    MODEL["pools"] = pools
+    MODEL["hazards"] = hazards
 
-    rng = random.Random(SEED)
-    occ = simulate(last_chart, pools, hazards, rng)
-    forecast = to_forecast(occ, PATHS * HORIZON_HOURS)
+    chart = reads[-1][1]                 # the chart as the history ends
+    hist = simulate(chart)
 
-    out_path = os.path.join(out_dir, "forecast.json")
+    total_steps = PATHS * HORIZON
+    probabilities = probabilities_from(hist, total_steps)
+    top10 = top10_from(hist, total_steps)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, "forecast.json")
     with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(forecast, fh, separators=(",", ":"))
-    print(f"wrote {out_path}: {len(forecast['probabilities'])} rows, "
-          f"top10={forecast['top10'][:3]}...")
+        json.dump({"probabilities": probabilities, "top10": top10}, fh)
+        fh.write("\n")
 
+    if os.environ.get("MAKEFUN_VERBOSE"):
+        for band in range(N_BANDS):
+            lo = 1 if band == 0 else BAND_BOUNDS[band - 1] + 1
+            hi = BAND_BOUNDS[band] if band < len(BAND_BOUNDS) else "inf"
+            pool = pools[band]
+            mean = sum(pool) / len(pool) if pool else 0.0
+            var = (sum((x - mean) ** 2 for x in pool) / len(pool)) if pool else 0.0
+            print(f"band {band} rank {lo}..{hi}: n={len(pool)} "
+                  f"obs={observations[band]} exits={exits[band]} "
+                  f"hazard={hazards[band]:.6f} mean={mean:+.4f} "
+                  f"sd={math.sqrt(var):.4f}")
+        print(f"reads={len(reads)} chart_n={len(chart)} rows={len(probabilities)}")
+        print("top10:", top10)
+
+
+MODEL = {}
 
 if __name__ == "__main__":
     main()
