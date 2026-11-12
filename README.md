@@ -77,12 +77,51 @@ window but degraded the two held-out windows; an age-conditioned exit hazard
 using `details.created` moved the practice score by under 0.3 nats in both
 directions across windows. Neither is in the shipped model.
 
+## Input parsing
+
+`/input/history.ndjson` is treated as untrusted. A single malformed record must
+never abort a run, so the reader validates everything and skips only what it
+cannot use:
+
+- **Malformed JSON** — the per-line `json.loads` is wrapped in `try/except`
+  (`ValueError`, `TypeError`); the line is counted and skipped. A line that
+  parses but is not a JSON object is skipped the same way.
+- **Failed reads** — records whose `ok` field is explicitly `false` are skipped.
+- **Unusable `up_and_coming`** — skipped when the field is missing, not a
+  `list`, `null`, or empty.
+- **Unusable rows** — dropped individually, never the whole record: a row that
+  is not an object, that has no `universe_id`, whose `universe_id` cannot be
+  coerced by `int()` (raising `TypeError`/`ValueError`), or whose `rank` is
+  below 1. Rows keep rank order; a record only survives if at least one row
+  survives.
+- **Unparseable `at`** — the timestamp is validated with `parse_at()` and the
+  record is dropped if it fails, since a read with no time cannot be paired.
+
+Skips are silent unless `MAKEFUN_VERBOSE` is set, in which case the reader
+prints how many lines and records it dropped.
+
 ## Determinism
 
-All randomness flows from one seeded `random.Random`. Two consecutive runs
-produce byte-identical `forecast.json` (verified by sha256). The program reads
-`$MAKEFUN_INPUT_DIR` / writes `$MAKEFUN_OUTPUT_DIR` when set, otherwise
-`/input` and `/output`, and never touches the network.
+Reproducibility is structural, not incidental — two runs produce
+byte-identical `forecast.json`, and this is verified by md5sum on repeated
+runs, both as separate processes and as repeated in-process calls.
+
+- **Single source of randomness.** One module-level `random.Random(SEED)` with
+  `SEED = 20261113`. There is no other randomness anywhere in the program: no
+  `random.random()`, no hashing of unordered containers, no clock, no
+  environment-dependent sampling. `simulate()` re-seeds that one instance from
+  `SEED` at entry, so even calling `main()` twice inside a single interpreter
+  reproduces the same paths rather than advancing a global stream.
+- **Deterministic ordering.** Probability rows are emitted sorted by
+  `(place, -count, universe_id)`, so no tie-break can depend on dict insertion
+  order. Empirically equal counts resolve by `universe_id`, never by the order
+  the histogram happened to be built in.
+- **No time, no network.** The program reads only the two directory variables;
+  the simulated window is a fixed `HORIZON` of steps from a fixed input, so
+  wall-clock time cannot influence the output.
+
+The program reads `$MAKEFUN_INPUT_DIR` / writes `$MAKEFUN_OUTPUT_DIR` when set,
+otherwise `/input` and `/output`, and never touches the network.
 
 ## Run locally
 
