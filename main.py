@@ -102,7 +102,7 @@ def build_pools(reads):
     for b in range(N_BANDS):
         e, n = exits[b]
         # ~6.3 hourly steps per recorded gap in the archive -> per-hour hazard
-        hazards.append(min(0.02, (e / n if n else 0.0) / 6.3))
+        hazards.append(min(0.02, ((e / n if n else 0.0) / 6.3) * HAZ_MUL))
     return pools, hazards
 
 
